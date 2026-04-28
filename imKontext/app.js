@@ -1,1418 +1,785 @@
-const API_BASE_URL = 'https://aleman-backend.onrender.com';
-const API_URL = `${API_BASE_URL}/api/vocabulario`;
-const CURRENT_TEXT_URL = 'https://samuelcoachdealeman.com/blog/f/leseverstehen-b1-elektrische-busse-werden-eingef%C3%BChrt';
-const STORAGE_KEY = 'samuel_aleman_progreso';
-const PRACTICADAS_KEY = 'samuel_aleman_practicadas';
-const COOLDOWN_MINUTES = 60;
-const NIVELES_CONFIG = {
-  a2: 'A2',
-  b1: 'B1',
-  b2: 'B2',
-  c1: 'C1'
+/* ═══════════════════════════════════════════════════════════════
+   VOKABEL LAB imKontext — app.js v7
+   Supabase: textos dinámicos + flujo 3 pasos
+═══════════════════════════════════════════════════════════════ */
+
+/* ── SUPABASE CONFIG ─────────────────────────────────────────── */
+const SUPABASE_URL  = 'https://fvhxbbhxucwawypfzikf.supabase.co';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ2aHhiYmh4dWN3YXd5cGZ6aWtmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyMzEzMzEsImV4cCI6MjA5MDgwNzMzMX0.LBSbe0SGXM5mGB9Ym6ljLUyI1Tug7yP9YNFlROE6kRE';
+
+async function sbFetch(path) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    headers: {
+      'apikey': SUPABASE_ANON,
+      'Authorization': `Bearer ${SUPABASE_ANON}`,
+    }
+  });
+  if (!res.ok) throw new Error(`Supabase error ${res.status}`);
+  return res.json();
+}
+
+/* ── STATE ───────────────────────────────────────────────────── */
+let allTexts       = [];   // [{id, title, slug, text_content, topic, ... levels:[]}]
+let selectedText   = null; // selected text object from Supabase
+let selectedLevel  = 'b1';
+let selectedModo   = null;
+let currentVocab   = [];
+let queue          = [];
+let currentIdx     = 0;
+let score          = { correct: 0, wrong: 0 };
+let streak         = 0;
+let numPalabras    = 10;
+
+/* ── DOM REFS ────────────────────────────────────────────────── */
+const $  = id => document.getElementById(id);
+const $$ = sel => document.querySelector(sel);
+
+const screens = {
+  landing:   $('screen-landing'),
+  textos:    $('screen-textos'),
+  content:   $('screen-content'),
+  activity:  $('screen-activity'),
+  ejercicio: $('screen-ejercicio'),
+  resultado: $('screen-resultado'),
 };
-const TIPOS_CONFIG = {
-  flashcards: 'Flashcards',
-  test: 'Test',
-  lueckentext: 'Lückentext',
-  articulo: 'Artículo',
-  ordenar: 'Ordenar frases'
-};
 
-let ejercicios = [];
-let indice = 0;
-let respuestas = [];
-let seleccionActual = null;
-let totalPalabras = 10;
-let vocabularioCacheado = null;
-let nivelSeleccionado = 'b1';
-let actividadesSeleccionadas = [];
-let palabrasDisponiblesNivel = [];
-let rachaActual = 0;
-let erroresUltimoResultado = [];
-let countdownInterval = null;
-let autoAdvanceTimeout = null;
-let respuestaBloqueada = false;
+/* ── SHOW/HIDE SCREEN ────────────────────────────────────────── */
+function showScreen(name) {
+  $('main-app').style.display = name === 'landing' ? 'none' : 'block';
+  screens.landing.style.display = name === 'landing' ? '' : 'none';
 
-const $ = id => document.getElementById(id);
-const setDisplay = (id, value) => { $(id).style.display = value; };
-const show = (id, value = 'block') => setDisplay(id, value);
-const hide = id => setDisplay(id, 'none');
+  ['textos','content','activity','ejercicio','resultado'].forEach(s => {
+    const el = screens[s];
+    if (el) el.style.display = s === name ? '' : 'none';
+  });
 
-function irAPantalla(screenId) {
-  ['screen-content', 'screen-activity', 'screen-ejercicio', 'screen-resultado'].forEach(hide);
-  show(screenId);
+  // hide loading/error when showing a real screen
+  $('loading').style.display = 'none';
+  $('error-msg').textContent = '';
+
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-function snapshotRespuesta(ej, raw) {
-  if (raw === null || raw === undefined || raw === '') return null;
-  if (Array.isArray(raw) && raw.length === 0) return null;
-  return {
-    pregunta: ej.pregunta,
-    tuya: textoUsuario(ej, raw),
-    correcta: textoCorrecta(ej),
-    correcto: evaluar(ej, raw),
-    _raw: Array.isArray(raw) ? [...raw] : raw,
-    palabraBase: ej.palabraBase || ej.pregunta,
-    ejercicioIndex: indice,
-    ejercicioOriginal: { ...ej }
-  };
-}
+/* ══════════════════════════════════════════════════════════════
+   PANTALLA 1 → LANDING
+══════════════════════════════════════════════════════════════ */
+$('btn-entrar').addEventListener('click', () => {
+  $('main-app').style.display = 'block';
+  screens.landing.style.display = 'none';
+  goToTextos();
+});
 
-function guardarProgreso() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      ejercicios,
-      indice,
-      respuestas,
-      totalPalabras,
-      nivelSeleccionado,
-      actividadesSeleccionadas,
-      ts: Date.now()
-    }));
-  } catch (e) {}
-}
+/* ══════════════════════════════════════════════════════════════
+   PANTALLA 2 — SELECCIÓN DE TEXTOS
+══════════════════════════════════════════════════════════════ */
+async function goToTextos() {
+  showScreen('textos');
 
-function cargarProgresoGuardado() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (Date.now() - data.ts > 86400000) {
-      localStorage.removeItem(STORAGE_KEY);
-      return null;
-    }
-    return data;
-  } catch (e) {
-    return null;
-  }
-}
-
-function limpiarProgreso() {
-  try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
-}
-
-function getPalabrasStats() {
-  try {
-    const raw = localStorage.getItem(PRACTICADAS_KEY);
-    if (!raw) return {};
-    const data = JSON.parse(raw);
-    if (Date.now() - data.ts > 7 * 86400000) {
-      localStorage.removeItem(PRACTICADAS_KEY);
-      return {};
-    }
-    if (data.stats && typeof data.stats === 'object') return data.stats;
-    if (Array.isArray(data.palabras)) {
-      return Object.fromEntries(
-        data.palabras.map(palabra => [
-          palabra,
-          { aciertos: 1, fallos: 0, completada: true, ultimaVezPorNivel: {} }
-        ])
-      );
-    }
-    return {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function getNivelProgressKey(nivel = nivelSeleccionado) {
-  return normalizarNivelValor(mapNivelSeleccionado(nivel));
-}
-
-function getPalabrasUsadas() {
-  const stats = getPalabrasStats();
-  return Object.entries(stats)
-    .filter(([, stat]) => stat && stat.completada)
-    .map(([palabra]) => palabra);
-}
-
-function guardarPalabrasUsadas(nuevas) {
-  try {
-    const actuales = getPalabrasStats();
-    const stats = { ...actuales };
-    nuevas.filter(Boolean).forEach(palabra => {
-      const previo = stats[palabra] || { aciertos: 0, fallos: 0, completada: false, ultimaVezPorNivel: {} };
-      stats[palabra] = {
-        aciertos: Math.max(previo.aciertos, 1),
-        fallos: previo.fallos,
-        completada: true,
-        ultimaVezPorNivel: previo.ultimaVezPorNivel || {}
-      };
-    });
-    localStorage.setItem(PRACTICADAS_KEY, JSON.stringify({
-      stats,
-      ts: Date.now()
-    }));
-  } catch (e) {}
-}
-
-function actualizarStatsPalabras(respuestasSesion) {
-  try {
-    const statsActuales = getPalabrasStats();
-    const stats = { ...statsActuales };
-
-    respuestasSesion.filter(Boolean).forEach(r => {
-      const palabra = r.palabraBase;
-      if (!palabra) return;
-      const previo = stats[palabra] || { aciertos: 0, fallos: 0, completada: false, ultimaVezPorNivel: {} };
-      const aciertos = previo.aciertos + (r.correcto ? 1 : 0);
-      const fallos = previo.fallos + (r.correcto ? 0 : 1);
-      stats[palabra] = {
-        aciertos,
-        fallos,
-        completada: previo.completada || r.correcto,
-        ultimaVezPorNivel: previo.ultimaVezPorNivel || {}
-      };
-    });
-
-    localStorage.setItem(PRACTICADAS_KEY, JSON.stringify({
-      stats,
-      ts: Date.now()
-    }));
-  } catch (e) {}
-}
-
-function resetPalabrasUsadas() {
-  try { localStorage.removeItem(PRACTICADAS_KEY); } catch (e) {}
-}
-
-function registrarAparicion(palabra, nivel = nivelSeleccionado) {
-  try {
-    if (!palabra) return;
-    const statsActuales = getPalabrasStats();
-    const previo = statsActuales[palabra] || { aciertos: 0, fallos: 0, completada: false, ultimaVezPorNivel: {} };
-    const claveNivel = getNivelProgressKey(nivel);
-    statsActuales[palabra] = {
-      ...previo,
-      ultimaVezPorNivel: {
-        ...(previo.ultimaVezPorNivel || {}),
-        [claveNivel]: Date.now()
-      }
-    };
-    localStorage.setItem(PRACTICADAS_KEY, JSON.stringify({
-      stats: statsActuales,
-      ts: Date.now()
-    }));
-  } catch (e) {}
-}
-
-function registrarAparicionesSesion(palabras, nivel = nivelSeleccionado) {
-  [...new Set((palabras || []).filter(Boolean))].forEach(palabra => registrarAparicion(palabra, nivel));
-}
-
-function cooldownSuperado(palabra, stats = getPalabrasStats(), nivel = nivelSeleccionado, minutosCooldown = COOLDOWN_MINUTES) {
-  const claveNivel = getNivelProgressKey(nivel);
-  const ultima = stats[palabra]?.ultimaVezPorNivel?.[claveNivel];
-  if (!ultima) return true;
-  return (Date.now() - ultima) > minutosCooldown * 60 * 1000;
-}
-
-function getUltimaVezPalabraNivel(palabra, stats = getPalabrasStats(), nivel = nivelSeleccionado) {
-  const claveNivel = getNivelProgressKey(nivel);
-  return stats[palabra]?.ultimaVezPorNivel?.[claveNivel] || 0;
-}
-
-function showError(msg) {
-  const el = $('error-msg');
-  el.textContent = msg;
-  show('error-msg');
-}
-
-function crearTonoDataUri(frecuencia, duracion = 0.12) {
-  const sampleRate = 8000;
-  const samples = Math.floor(sampleRate * duracion);
-  const buffer = new ArrayBuffer(44 + samples * 2);
-  const view = new DataView(buffer);
-  const writeString = (offset, text) => {
-    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
-  };
-
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + samples * 2, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeString(36, 'data');
-  view.setUint32(40, samples * 2, true);
-
-  for (let i = 0; i < samples; i += 1) {
-    const fade = 1 - (i / samples);
-    const sampleValue = Math.sin((2 * Math.PI * frecuencia * i) / sampleRate) * 0.28 * fade;
-    view.setInt16(44 + i * 2, sampleValue * 32767, true);
-  }
-
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  bytes.forEach(byte => { binary += String.fromCharCode(byte); });
-  return `data:audio/wav;base64,${btoa(binary)}`;
-}
-
-const audioCorrecto = new Audio(crearTonoDataUri(760, 0.16));
-const audioIncorrecto = new Audio(crearTonoDataUri(180, 0.12));
-audioCorrecto.preload = 'auto';
-audioIncorrecto.preload = 'auto';
-
-function reproducirSonido(correcto) {
-  try {
-    const audio = correcto ? audioCorrecto : audioIncorrecto;
-    audio.pause();
-    audio.currentTime = 0;
-    audio.volume = 0.28;
-    audio.play().catch(() => {});
-  } catch (e) {}
-}
-
-function limpiarTemporizadores() {
-  if (countdownInterval) window.clearInterval(countdownInterval);
-  if (autoAdvanceTimeout) window.clearTimeout(autoAdvanceTimeout);
-  countdownInterval = null;
-  autoAdvanceTimeout = null;
-  const countdown = $('next-countdown');
-  if (countdown) {
-    countdown.textContent = '';
-    countdown.classList.remove('visible');
-  }
-}
-
-function guardarRespuestaActual() {
-  respuestas[indice] = snapshotRespuesta(ejercicios[indice], seleccionActual);
-  guardarProgreso();
-}
-
-function avanzarTrasRespuesta() {
-  guardarRespuestaActual();
-  const esUltimo = indice === ejercicios.length - 1;
-
-  if (esUltimo) {
-    mostrarResultado();
+  // If already loaded, just render
+  if (allTexts.length > 0) {
+    renderTextGrid(allTexts);
     return;
   }
 
-  indice += 1;
-  renderEjercicio(ejercicios[indice], indice + 1, ejercicios.length, respuestas[indice]?._raw ?? null);
-  guardarProgreso();
+  // Load from Supabase
+  $('txsel-loading').style.display = 'flex';
+  $('txsel-grid').style.display    = 'none';
+  $('txsel-error').style.display   = 'none';
+
+  try {
+    const [texts, versions] = await Promise.all([
+      sbFetch('texts?select=id,title,slug,text_content,topic,access_status,published_at&order=published_at.desc.nullslast,id.desc'),
+      sbFetch('text_versions?select=text_id,level'),
+    ]);
+
+    // Build map: text_id → [levels]
+    const levMap = {};
+    versions.forEach(v => {
+      if (!levMap[v.text_id]) levMap[v.text_id] = new Set();
+      levMap[v.text_id].add(v.level);
+    });
+
+    allTexts = texts.map(t => ({
+      ...t,
+      levels: levMap[t.id] ? Array.from(levMap[t.id]).sort() : []
+    }));
+
+    renderTextGrid(allTexts);
+  } catch (err) {
+    console.error(err);
+    $('txsel-loading').style.display = 'none';
+    $('txsel-error').style.display   = 'block';
+  }
 }
 
-function iniciarCuentaAtrasAutoavance() {
-  limpiarTemporizadores();
-  const countdown = $('next-countdown');
-  let segundos = 4;
+function renderTextGrid(list) {
+  $('txsel-loading').style.display = 'none';
+  $('txsel-error').style.display   = 'none';
 
-  if (countdown) {
-    countdown.textContent = `Siguiente en ${segundos}...`;
-    countdown.classList.add('visible');
+  const grid = $('txsel-grid');
+  grid.style.display = 'grid';
+  grid.innerHTML = '';
+
+  if (list.length === 0) {
+    grid.innerHTML = '<div class="txsel-empty">No se encontraron textos.</div>';
+    return;
   }
 
-  countdownInterval = window.setInterval(() => {
-    segundos -= 1;
-    if (countdown && segundos > 0) countdown.textContent = `Siguiente en ${segundos}...`;
-    if (segundos <= 0 && countdownInterval) {
-      window.clearInterval(countdownInterval);
-      countdownInterval = null;
+  list.forEach((text, i) => {
+    const card = document.createElement('button');
+    card.className = 'tx-card';
+    card.setAttribute('role', 'listitem');
+    card.setAttribute('aria-label', `Seleccionar texto: ${text.title}`);
+
+    const lvlBadges = text.levels.map(l =>
+      `<span class="tx-lvl-badge tx-lvl-badge--${l}">${l}</span>`
+    ).join('');
+
+    card.innerHTML = `
+      <span class="tx-card-num">#${String(i + 1).padStart(2, '0')}</span>
+      <span class="tx-card-title">${escapeHtml(text.title)}</span>
+      <div class="tx-card-levels">${lvlBadges}</div>
+      <span class="tx-card-arrow">→</span>
+    `;
+
+    card.addEventListener('click', () => selectText(text));
+    grid.appendChild(card);
+  });
+}
+
+// Live search
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
+}
+
+$('txsel-search').addEventListener('input', debounce(e => {
+  const q = e.target.value.toLowerCase().trim();
+  if (!q) { renderTextGrid(allTexts); return; }
+  const filtered = allTexts.filter(t => t.title.toLowerCase().includes(q));
+  renderTextGrid(filtered);
+}, 200));
+
+$('btn-volver-landing-from-textos').addEventListener('click', () => {
+  $('main-app').style.display = 'none';
+  screens.landing.style.display = '';
+});
+
+/* ══════════════════════════════════════════════════════════════
+   PANTALLA 2b — DETALLE DE TEXTO
+══════════════════════════════════════════════════════════════ */
+function selectText(text) {
+  selectedText = text;
+
+  // Update header
+  $('content-title').textContent = text.title || 'Texto';
+  $('content-description').textContent =
+    `Lee "${text.title}" directamente desde Supabase y vuelve cuando estés listo para practicar el vocabulario.`;
+  $('content-meta').innerHTML = renderTextMeta(text);
+  $('content-body').innerHTML = renderTextBody(text);
+
+  // Also update activity title for step 3
+  $('act-text-title').textContent = text.title || 'Configura tu práctica';
+
+  showScreen('content');
+}
+
+$('btn-volver-textos').addEventListener('click', () => {
+  goToTextos();
+});
+
+$('btn-ir-actividad').addEventListener('click', () => {
+  loadActivityScreen();
+  showScreen('activity');
+});
+
+/* ══════════════════════════════════════════════════════════════
+   PANTALLA 3 — CONFIGURAR ACTIVIDAD
+══════════════════════════════════════════════════════════════ */
+function loadActivityScreen() {
+  if (!selectedText) return;
+  updateProgressPanel();
+  checkSavedProgress();
+  updateSliderMax();
+}
+
+$('btn-volver-contenido-from-activity').addEventListener('click', () => {
+  showScreen('content');
+});
+
+// Level chips
+document.querySelectorAll('#level-selector .config-chip').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#level-selector .config-chip').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedLevel = btn.dataset.level;
+    updateProgressPanel();
+    updateSliderMax();
+  });
+});
+
+// Mode chips (toggle)
+document.querySelectorAll('#practice-selector .config-chip').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn.classList.contains('active')) {
+      btn.classList.remove('active');
+      selectedModo = null;
+    } else {
+      document.querySelectorAll('#practice-selector .config-chip').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedModo = btn.dataset.modo;
+    }
+    updateModoHint();
+  });
+});
+
+function updateModoHint() {
+  const hint = $('practice-hint');
+  if (!selectedModo) {
+    hint.textContent = 'Si no eliges ninguna actividad, practicarás con todos los formatos.';
+  } else {
+    const labels = {
+      ordenar: 'Ordenarás frases en el orden correcto.',
+      test: 'Elegirás la traducción correcta entre 4 opciones.',
+      flashcards: 'Verás la palabra y decidirás si la sabes o no.',
+      articulo: 'Escribirás el artículo correcto (der/die/das).',
+      lueckentext: 'Completarás huecos en frases.',
+    };
+    hint.textContent = labels[selectedModo] || '';
+  }
+}
+
+// Words slider
+const slider = $('slider-palabras');
+slider.addEventListener('input', () => {
+  numPalabras = parseInt(slider.value);
+  $('num-palabras-display').textContent = numPalabras;
+});
+
+async function updateSliderMax() {
+  if (!selectedText) return;
+  try {
+    const versions = await sbFetch(
+      `text_versions?text_id=eq.${selectedText.id}&level=eq.${selectedLevel.toUpperCase()}&select=id`
+    );
+    const vId = versions[0]?.id;
+    if (!vId) return;
+    const vocab = await sbFetch(
+      `text_version_vocabulary?text_version_id=eq.${vId}&select=vocabulario_id`
+    );
+    const max = vocab.length || 10;
+    slider.max = max;
+    $('slider-max-label').textContent = max;
+    if (numPalabras > max) {
+      numPalabras = max;
+      slider.value = max;
+      $('num-palabras-display').textContent = max;
+    }
+  } catch {}
+}
+
+/* ── Progress panel ─────────────────────────────────────────── */
+function updateProgressPanel() {
+  if (!selectedText) return;
+  const key = `progress_${selectedText.id}_${selectedLevel}`;
+  const data = JSON.parse(localStorage.getItem(key) || 'null');
+  const lvlLabel = selectedLevel.toUpperCase();
+
+  $('weekly-progress-title').textContent = `Progreso ${lvlLabel}`;
+
+  if (data) {
+    const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 0;
+    $('weekly-progress-pct').textContent = `${pct}% completado`;
+    $('weekly-progress-fill').style.width = `${pct}%`;
+    $('weekly-progress-main').textContent = `${data.done} / ${data.total} palabras practicadas`;
+    $('weekly-progress-sub').textContent  = `${data.total} palabras en nivel ${lvlLabel}`;
+  } else {
+    $('weekly-progress-pct').textContent  = '0% completado';
+    $('weekly-progress-fill').style.width = '0%';
+    $('weekly-progress-main').textContent = '0 / 0 palabras practicadas';
+    $('weekly-progress-sub').textContent  = `Nivel ${lvlLabel}`;
+  }
+}
+
+function checkSavedProgress() {
+  if (!selectedText) return;
+  const key = `queue_${selectedText.id}_${selectedLevel}`;
+  const saved = localStorage.getItem(key);
+  const banner = $('progreso-guardado-banner');
+  if (saved) {
+    const q = JSON.parse(saved);
+    $('prog-guardado-txt').textContent = `${q.length} palabras pendientes`;
+    banner.style.display = 'block';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+$('btn-reset-progress').addEventListener('click', () => {
+  if (!selectedText) return;
+  const key = `progress_${selectedText.id}_${selectedLevel}`;
+  const qkey = `queue_${selectedText.id}_${selectedLevel}`;
+  localStorage.removeItem(key);
+  localStorage.removeItem(qkey);
+  updateProgressPanel();
+  checkSavedProgress();
+});
+
+/* ── Start practice ─────────────────────────────────────────── */
+$('btn-empezar').addEventListener('click', startPractice);
+
+async function startPractice() {
+  if (!selectedText) return;
+
+  $('btn-empezar').disabled = true;
+  $('btn-empezar').textContent = 'Cargando…';
+
+  try {
+    // 1. Get text version for selected level
+    const versions = await sbFetch(
+      `text_versions?text_id=eq.${selectedText.id}&level=eq.${selectedLevel.toUpperCase()}&select=id`
+    );
+    if (!versions.length) throw new Error('No hay versión para este nivel.');
+    const vId = versions[0].id;
+
+    // 2. Get vocabulary IDs for this version
+    const links = await sbFetch(
+      `text_version_vocabulary?text_version_id=eq.${vId}&select=vocabulario_id`
+    );
+    const vocabIds = links.map(l => l.vocabulario_id);
+
+    if (!vocabIds.length) throw new Error('No hay vocabulario para este texto y nivel.');
+
+    // 3. Get vocabulary details
+    const vocab = await sbFetch(
+      `vocabulario?id=in.(${vocabIds.join(',')})&select=id,german,spanish,article,word_type,example_sentence_de`
+    );
+
+    currentVocab = vocab;
+
+    // Shuffle and slice
+    const shuffled = [...vocab].sort(() => Math.random() - .5);
+    const n = Math.min(numPalabras, shuffled.length);
+    queue = shuffled.slice(0, n);
+    currentIdx = 0;
+    score = { correct: 0, wrong: 0 };
+
+    // Save max for progress
+    const pKey = `progress_${selectedText.id}_${selectedLevel}`;
+    const existing = JSON.parse(localStorage.getItem(pKey) || 'null');
+    localStorage.setItem(pKey, JSON.stringify({
+      total: vocab.length,
+      done: existing?.done || 0,
+    }));
+
+    // Slider max update
+    slider.max = vocab.length;
+    $('slider-max-label').textContent = vocab.length;
+
+    showScreen('ejercicio');
+    buildExercise();
+
+  } catch (err) {
+    console.error(err);
+    $('error-msg').textContent = `Error: ${err.message}`;
+  } finally {
+    $('btn-empezar').disabled = false;
+    $('btn-empezar').textContent = 'Empezar práctica 🚀';
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   EJERCICIO ENGINE
+══════════════════════════════════════════════════════════════ */
+const MODOS = ['test', 'flashcards', 'ordenar', 'articulo', 'lueckentext'];
+
+function getModo(idx) {
+  if (selectedModo) return selectedModo;
+  return MODOS[idx % MODOS.length];
+}
+
+function buildExercise() {
+  if (currentIdx >= queue.length) {
+    showResultado(); return;
+  }
+
+  const word  = queue[currentIdx];
+  const modo  = getModo(currentIdx);
+  const total = queue.length;
+
+  // Progress bar
+  $('prog-actual').textContent = currentIdx + 1;
+  $('prog-total').textContent  = total;
+  $('prog-fill').style.width   = `${((currentIdx) / total) * 100}%`;
+
+  // Dots
+  const dotsWrap = $('progreso-dots');
+  dotsWrap.innerHTML = '';
+  queue.forEach((_, i) => {
+    const d = document.createElement('div');
+    d.className = 'progreso-dot' + (i < currentIdx ? ' correct' : i === currentIdx ? ' current' : '');
+    dotsWrap.appendChild(d);
+  });
+
+  // Badge
+  const labels = {
+    test: '🎯 Test', flashcards: '🃏 Flashcard',
+    ordenar: '🔀 Ordenar', articulo: '📖 Artículo', lueckentext: '✏️ Lückentext'
+  };
+  $('tipo-badge').textContent = labels[modo] || modo;
+
+  // Hide all input types
+  $('opciones-wrap').innerHTML = '';
+  $('opciones-wrap').style.display = 'none';
+  $('flashcard-wrap').style.display = 'none';
+  $('input-wrap').style.display = 'none';
+  $('ordenar-wrap').style.display = 'none';
+  $('respuesta-feedback').textContent = '';
+  $('respuesta-feedback').className   = 'respuesta-feedback';
+  $('next-countdown').textContent     = '';
+  $('translation-panel').classList.remove('visible');
+  $('btn-toggle-traduccion').style.display = 'none';
+  $('btn-siguiente').disabled = true;
+  $('btn-siguiente').style.display = 'inline-flex';
+  $('btn-siguiente').onclick = () => nextWord();
+
+  switch (modo) {
+    case 'test':       buildTest(word);       break;
+    case 'flashcards': buildFlashcard(word);  break;
+    case 'ordenar':    buildOrdenar(word);    break;
+    case 'articulo':   buildArticulo(word);   break;
+    case 'lueckentext':buildLueckentext(word);break;
+  }
+}
+
+/* ── TEST ────────────────────────────────────────────────────── */
+function buildTest(word) {
+  $('pregunta-texto').textContent = word.german;
+  $('pregunta-sub').textContent   = word.word_type || '';
+  $('btn-toggle-traduccion').style.display = 'block';
+  $('translation-panel').textContent = word.example_sentence_de || '';
+
+  const wrong3 = getRandomWrong(word, 3);
+  const opts = shuffle([word.spanish, ...wrong3.map(w => w.spanish)]);
+
+  const wrap = $('opciones-wrap');
+  wrap.style.display = 'flex';
+  opts.forEach(opt => {
+    const btn = document.createElement('button');
+    btn.className = 'opcion';
+    btn.textContent = opt;
+    btn.addEventListener('click', () => {
+      const correct = opt === word.spanish;
+      markAnswer(btn, correct, word, correct ? null : word.spanish);
+      disableOptions();
+      autoNext();
+    });
+    wrap.appendChild(btn);
+  });
+}
+
+/* ── FLASHCARD ───────────────────────────────────────────────── */
+function buildFlashcard(word) {
+  $('pregunta-texto').textContent = '';
+  $('pregunta-sub').textContent   = '';
+  $('flashcard-wrap').style.display = 'block';
+  $('btn-siguiente').style.display  = 'none';
+
+  const fc = $('flashcard-card');
+  fc.classList.remove('flipped');
+  $('flashcard-front').textContent = word.german;
+  $('flashcard-back').textContent  = word.spanish;
+
+  fc.onclick = () => fc.classList.toggle('flipped');
+
+  $('btn-flashcard-si').onclick = () => {
+    recordScore(true, word);
+    nextWord();
+  };
+  $('btn-flashcard-no').onclick = () => {
+    recordScore(false, word);
+    nextWord();
+  };
+}
+
+/* ── ORDENAR ─────────────────────────────────────────────────── */
+function buildOrdenar(word) {
+  const sentence = word.example_sentence_de || `${word.german} — ${word.spanish}`;
+  $('pregunta-texto').textContent = `Ordena las palabras:`;
+  $('pregunta-sub').textContent   = word.spanish;
+
+  const tokens = sentence.split(' ').sort(() => Math.random() - .5);
+  const banco  = $('banco-palabras');
+  const constr = $('orden-construccion');
+  banco.innerHTML = constr.innerHTML = '';
+  $('ordenar-wrap').style.display = 'block';
+
+  tokens.forEach(t => {
+    const pill = document.createElement('button');
+    pill.className = 'palabra-token';
+    pill.textContent = t;
+    pill.onclick = () => {
+      constr.appendChild(pill);
+      checkOrdenar(sentence);
+    };
+    banco.appendChild(pill);
+  });
+
+  // allow clicking back from construction zone
+  constr.addEventListener('click', e => {
+    if (e.target.classList.contains('palabra-token')) {
+      banco.appendChild(e.target);
+      checkOrdenar(sentence);
+    }
+  });
+}
+
+function checkOrdenar(original) {
+  const constr   = $('orden-construccion');
+  const built    = Array.from(constr.querySelectorAll('.palabra-token')).map(p => p.textContent).join(' ');
+  const allUsed  = $('banco-palabras').querySelectorAll('.palabra-token').length === 0;
+  if (allUsed) {
+    const correct = built.trim() === original.trim();
+    $('respuesta-feedback').textContent  = correct ? '✓ ¡Correcto!' : `✗ Era: "${original}"`;
+    $('respuesta-feedback').className    = `respuesta-feedback ${correct ? 'correct' : 'wrong'}`;
+    recordScore(correct, queue[currentIdx]);
+    $('btn-siguiente').disabled = false;
+  }
+}
+
+/* ── ARTÍCULO ────────────────────────────────────────────────── */
+function buildArticulo(word) {
+  const article = word.article?.toLowerCase();
+  $('pregunta-texto').innerHTML = `<em>___</em> ${word.german}`;
+  $('pregunta-sub').textContent = word.spanish;
+
+  const opts = ['der', 'die', 'das'];
+  const wrap = $('opciones-wrap');
+  wrap.style.display = 'flex';
+
+  opts.forEach(opt => {
+    const btn = document.createElement('button');
+    btn.className = 'opcion';
+    btn.textContent = opt;
+    btn.onclick = () => {
+      const correct = article ? opt === article : opt === 'das';
+      markAnswer(btn, correct, word, article);
+      disableOptions();
+      autoNext();
+    };
+    wrap.appendChild(btn);
+  });
+}
+
+/* ── LÜCKENTEXT ──────────────────────────────────────────────── */
+function buildLueckentext(word) {
+  const sentence = word.example_sentence_de || `${word.german} bedeutet ${word.spanish}.`;
+  const blanked  = sentence.replace(word.german, '______');
+
+  $('pregunta-texto').textContent = blanked;
+  $('pregunta-sub').textContent   = `(${word.spanish})`;
+  $('input-wrap').style.display   = 'block';
+
+  const input = $('input-traduccion');
+  input.value = '';
+  input.focus();
+
+  input.onkeydown = e => {
+    if (e.key === 'Enter') checkLuecken(word);
+  };
+
+  $('btn-siguiente').disabled = false;
+  $('btn-siguiente').onclick  = () => {
+    checkLuecken(word);
+    nextWord();
+  };
+}
+
+function checkLuecken(word) {
+  const val     = $('input-traduccion').value.trim().toLowerCase();
+  const correct = val === word.german.toLowerCase();
+  $('respuesta-feedback').textContent = correct ? '✓ ¡Correcto!' : `✗ Era: "${word.german}"`;
+  $('respuesta-feedback').className   = `respuesta-feedback ${correct ? 'correct' : 'wrong'}`;
+  recordScore(correct, word);
+}
+
+/* ── HELPERS ─────────────────────────────────────────────────── */
+function markAnswer(btn, correct, word, correctLabel) {
+  btn.classList.add(correct ? 'correct-ans' : 'wrong-ans');
+  if (!correct && correctLabel) {
+    const allBtns = $('opciones-wrap').querySelectorAll('.opcion');
+    allBtns.forEach(b => { if (b.textContent === correctLabel) b.classList.add('correct-ans'); });
+  }
+  recordScore(correct, word);
+  $('respuesta-feedback').textContent = correct ? '✓ ¡Correcto!' : `✗ Era: "${correctLabel || ''}"`;
+  $('respuesta-feedback').className   = `respuesta-feedback ${correct ? 'correct' : 'wrong'}`;
+}
+
+function disableOptions() {
+  $('opciones-wrap').querySelectorAll('.opcion').forEach(b => b.disabled = true);
+}
+
+function recordScore(correct, word) {
+  if (correct) {
+    score.correct++;
+    streak++;
+    $('streak-count').textContent = streak;
+  } else {
+    score.wrong++;
+    streak = 0;
+    $('streak-count').textContent = 0;
+  }
+}
+
+function autoNext() {
+  let t = 3;
+  const countdown = $('next-countdown');
+  countdown.textContent = `Siguiente en ${t}…`;
+  const iv = setInterval(() => {
+    t--;
+    if (t <= 0) {
+      clearInterval(iv);
+      countdown.textContent = '';
+      nextWord();
+    } else {
+      countdown.textContent = `Siguiente en ${t}…`;
     }
   }, 1000);
-
-  autoAdvanceTimeout = window.setTimeout(() => {
-    limpiarTemporizadores();
-    avanzarTrasRespuesta();
-  }, 4000);
+  $('btn-siguiente').disabled = false;
+  $('btn-siguiente').onclick  = () => { clearInterval(iv); nextWord(); };
 }
 
-function actualizarRacha(correcto) {
-  rachaActual = correcto ? rachaActual + 1 : 0;
-  const pill = $('streak-pill');
-  const count = $('streak-count');
-  if (!pill || !count) return;
-  count.textContent = rachaActual;
-  pill.classList.toggle('visible', rachaActual >= 1);
+function nextWord() {
+  currentIdx++;
+  buildExercise();
 }
 
-function renderProgresoDots(actual, total) {
-  const wrap = $('progreso-dots');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  for (let i = 1; i <= total; i += 1) {
-    const dot = document.createElement('span');
-    dot.className = 'progreso-dot';
-    if (i < actual) dot.classList.add('done');
-    if (i === actual) dot.classList.add('active');
-    wrap.appendChild(dot);
-  }
-}
-
-function animarCambioPregunta() {
-  const card = $('screen-ejercicio');
-  if (!card) return;
-  card.classList.remove('question-enter');
-  void card.offsetWidth;
-  card.classList.add('question-enter');
-}
-
-function getTraduccionEjercicio(ej) {
-  if (ej.tipo === 'ordenar') return '';
-  if (ej.traduccionBase) return ej.traduccionBase;
-  if (ej.tipo === 'flashcards') return ej.respuestaCorrecta;
-  if (ej.traducciones) return ej.traducciones[textoCorrecta(ej)] || '';
-  return '';
-}
-
-function configurarTraduccion(ej) {
-  const btn = $('btn-toggle-traduccion');
-  const panel = $('translation-panel');
-  if (!btn || !panel) return;
-
-  const traduccion = getTraduccionEjercicio(ej);
-  panel.textContent = traduccion;
-  panel.classList.remove('visible');
-  btn.textContent = 'Ver traducción';
-  btn.style.display = traduccion ? 'inline-flex' : 'none';
-
-  btn.onclick = () => {
-    const visible = panel.classList.toggle('visible');
-    btn.textContent = visible ? 'Ocultar traducción' : 'Ver traducción';
-  };
-}
-
-function limpiarFeedbackRespuesta() {
-  const el = $('respuesta-feedback');
-  if (!el) return;
-  el.textContent = '';
-  el.className = 'respuesta-feedback';
-  hide('respuesta-feedback');
-}
-
-function mostrarFeedbackRespuesta(correcto, registrar = true) {
-  const el = $('respuesta-feedback');
-  if (!el) return;
-  el.textContent = correcto ? 'Gut!' : ':(';
-  el.className = `respuesta-feedback feedback-popup ${correcto ? 'correcta' : 'incorrecta'}`;
-  show('respuesta-feedback');
-  if (registrar) {
-    reproducirSonido(correcto);
-    actualizarRacha(correcto);
-  }
-  window.setTimeout(() => {
-    if (el.classList.contains('feedback-popup')) hide('respuesta-feedback');
-  }, 3000);
-}
-
-function aplicarFeedbackOpciones(ej, respuestaElegida, registrar = true) {
-  const botones = [...document.querySelectorAll('#opciones-wrap .opcion-btn')];
-  const correcta = String(ej.respuestaCorrecta || '').toUpperCase();
-  const elegida = String(respuestaElegida || '').toUpperCase();
-  const acierto = elegida === correcta;
-
-  botones.forEach(btn => {
-    const opcion = btn.dataset.opcion;
-    btn.disabled = true;
-    btn.classList.remove('seleccionada');
-
-    if (opcion === correcta) {
-      btn.classList.add('resultado-correcta');
-      if (ej.tipo === 'articulo') btn.classList.add('articulo-correcta-destacada');
-    } else {
-      btn.classList.add('resultado-incorrecta-suave');
-    }
-
-    if (opcion === elegida && opcion !== correcta) {
-      btn.classList.add('resultado-incorrecta');
-    }
-  });
-
-  mostrarFeedbackRespuesta(acierto, registrar);
-}
-
-function getActividadesActivas() {
-  return [...document.querySelectorAll('#practice-selector .config-chip.active')]
-    .map(btn => btn.dataset.modo)
-    .filter(Boolean);
-}
-
-function getNivelActivo() {
-  return document.querySelector('#level-selector .config-chip.active')?.dataset.level || 'b1';
-}
-
-function getTiposEfectivos(actividades = actividadesSeleccionadas) {
-  return Array.isArray(actividades) && actividades.length > 0 ? actividades : Object.keys(TIPOS_CONFIG);
-}
-
-function normalizarActividadGuardada(valor) {
-  if (valor === 'traduccion') return 'flashcards';
-  if (valor === 'completar') return 'lueckentext';
-  return valor;
-}
-
-function normalizarActividadesGuardadas(valor) {
-  if (Array.isArray(valor)) return valor.map(normalizarActividadGuardada);
-  if (typeof valor === 'string') return [normalizarActividadGuardada(valor)];
-  return [];
-}
-
-function actualizarNivelSeleccionado() {
-  nivelSeleccionado = getNivelActivo();
-}
-
-function mapNivelSeleccionado(nivel = nivelSeleccionado) {
-  return {
-    a2: 'A2',
-    b1: 'B1',
-    b2: 'B2',
-    c1: 'C1'
-  }[nivel] || 'B1';
-}
-
-function normalizarNivelGuardado(valor) {
-  if (valor === 'a2b1') return 'b1';
-  return valor;
-}
-
-function normalizarNivelValor(valor) {
-  return String(valor || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, '')
-    .replace(/[-–—]/g, '')
-    .trim();
-}
-
-function getClaveNivelDato(valor) {
-  const normalizado = normalizarNivelValor(valor);
-
-  if (normalizado === 'a2') return 'a2';
-  if (normalizado === 'b1') return 'b1';
-  if (normalizado === 'b2') return 'b2';
-  if (normalizado === 'c1') return 'c1';
-
-  // Ignoramos niveles compuestos legacy como A2-B1 para no mezclar pools.
-  return '';
-}
-
-function actualizarHintActividad() {
-  actividadesSeleccionadas = getActividadesActivas();
-  const hint = $('practice-hint');
-
-  if (actividadesSeleccionadas.length === 0) {
-    hint.textContent = 'Si no eliges ninguna actividad, practicarás con todos los formatos.';
-    return;
-  }
-  hint.textContent = `Practicarás con: ${actividadesSeleccionadas.map(tipo => TIPOS_CONFIG[tipo]).join(', ')}.`;
-}
-
-function activarActividadesEnPantalla(actividades) {
-  const activas = Array.isArray(actividades) ? actividades : [];
-  document.querySelectorAll('#practice-selector .config-chip').forEach(btn => {
-    btn.classList.toggle('active', activas.includes(btn.dataset.modo));
-  });
-  actividadesSeleccionadas = activas;
-  actualizarHintActividad();
-}
-
-function activarNivelEnPantalla(nivel) {
-  document.querySelectorAll('#level-selector .config-chip').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.level === nivel);
-  });
-  nivelSeleccionado = nivel || 'b1';
+function getRandomWrong(word, n) {
+  const pool = currentVocab.filter(w => w.id !== word.id);
+  return shuffle(pool).slice(0, n);
 }
 
 function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+  return [...arr].sort(() => Math.random() - .5);
 }
 
-function sample(arr, n) {
-  return shuffle(arr).slice(0, Math.min(n, arr.length));
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
 }
 
-function normalizar(txt) {
-  return String(txt || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[.,!?;:¡¿]/g, '')
-    .trim();
-}
+function renderTextMeta(text) {
+  const bits = [];
 
-function extraerArticulo(aleman) {
-  const m = String(aleman || '').match(/^(der|die|das)\s+/i);
-  return m ? m[1].toLowerCase() : null;
-}
-
-function quitarArticulo(aleman) {
-  return String(aleman || '').replace(/^(der|die|das)\s+/i, '').trim();
-}
-
-function escaparRegex(texto) {
-  return String(texto || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function getStatsPalabra(palabraBase) {
-  return getPalabrasStats()[palabraBase] || { aciertos: 0, fallos: 0, completada: false };
-}
-
-function getCategoriaBase(item) {
-  return normalizar(item?.categoria || '');
-}
-
-function getCategoriaGramatical(item) {
-  const categoria = getCategoriaBase(item);
-  if (/(adjet|adjektiv)/.test(categoria)) return 'adjetivo';
-  if (/(verb)/.test(categoria)) return 'verbo';
-  if (/(sustant|substantiv|noun|nombre)/.test(categoria) || extraerArticulo(item?.aleman)) return 'sustantivo';
-  if (/(adverb)/.test(categoria)) return 'adverbio';
-  if (/(pron)/.test(categoria)) return 'pronombre';
-  if (/(prep)/.test(categoria)) return 'preposicion';
-  if (/(expres|locuc|frase|idiom)/.test(categoria) || esMultiPalabra(item?.aleman)) return 'expresion';
-  return categoria || 'otro';
-}
-
-function esMultiPalabra(texto) {
-  return String(texto || '').trim().includes(' ');
-}
-
-function puntuarDistractor(candidata, correcta, campo) {
-  let score = 0;
-  if (getCategoriaGramatical(candidata) === getCategoriaGramatical(correcta)) score += 8;
-  if (getCategoriaBase(candidata) && getCategoriaBase(candidata) === getCategoriaBase(correcta)) score += 4;
-  if (Boolean(extraerArticulo(candidata.aleman)) === Boolean(extraerArticulo(correcta.aleman))) score += 3;
-  if (esMultiPalabra(candidata[campo]) === esMultiPalabra(correcta[campo])) score += 2;
-
-  const diffCampo = Math.abs(String(candidata[campo] || '').length - String(correcta[campo] || '').length);
-  const diffAleman = Math.abs(String(candidata.aleman || '').length - String(correcta.aleman || '').length);
-  score += Math.max(0, 4 - Math.min(diffCampo, 4));
-  score += Math.max(0, 3 - Math.min(diffAleman, 3));
-
-  const candStats = getStatsPalabra(candidata.aleman);
-  score += Math.min(candStats.fallos, 3);
-  return score;
-}
-
-function filtrarPorNivel(lista, nivel = nivelSeleccionado) {
-  const objetivo = getClaveNivelDato(mapNivelSeleccionado(nivel));
-  if (!objetivo) return [];
-  return lista.filter(item => getClaveNivelDato(item.nivel || '') === objetivo);
-}
-
-function actualizarDisponibilidadNivel() {
-  if (!vocabularioCacheado) return;
-
-  palabrasDisponiblesNivel = filtrarPorNivel(vocabularioCacheado, nivelSeleccionado);
-  const disponibles = palabrasDisponiblesNivel.length;
-  const slider = $('slider-palabras');
-  const status = $('level-status');
-  const btn = $('btn-empezar');
-
-  $('slider-max-label').textContent = disponibles;
-
-  if (disponibles === 0) {
-    slider.min = 0;
-    slider.max = 0;
-    slider.value = 0;
-    slider.disabled = true;
-    $('num-palabras-display').textContent = '0';
-    status.textContent = 'Todavía no hay vocabulario disponible para este nivel.';
-    status.className = 'level-status empty';
-    btn.disabled = true;
-    actualizarPanelProgresoSemanal();
-    return;
+  if (text.topic) {
+    bits.push(`<span class="txdet-pill">${escapeHtml(text.topic)}</span>`);
   }
 
-  slider.disabled = false;
-  slider.min = Math.min(5, disponibles);
-  slider.max = disponibles;
-  slider.value = String(Math.min(Number(slider.value) || slider.min, disponibles));
-  $('num-palabras-display').textContent = slider.value;
-  status.textContent = `${disponibles} palabras disponibles para este nivel.`;
-  status.className = 'level-status ready';
-  btn.disabled = false;
-  actualizarPanelProgresoSemanal();
-}
-
-async function cargarVocabulario() {
-  const res = await fetch(API_URL);
-  if (!res.ok) {
-    let detalle = `HTTP ${res.status}`;
-    try {
-      const errorData = await res.json();
-      if (errorData?.details) {
-        detalle = `${errorData.error || "Error"}: ${errorData.details}`;
-      } else if (errorData?.error) {
-        detalle = errorData.error;
-      }
-    } catch (e) {}
-    throw new Error(detalle);
-  }
-  const data = await res.json();
-  if (!Array.isArray(data.palabras)) throw new Error('Formato incorrecto');
-  const lista = data.palabras
-    .filter(p => p.aleman && p.espanol)
-    .map(p => ({ ...p, frase: p.frase || '', nivel: p.nivel || '' }));
-
-  return lista;
-}
-
-function getPoolDistractoresNivel() {
-  return Array.isArray(palabrasDisponiblesNivel) && palabrasDisponiblesNivel.length > 0
-    ? palabrasDisponiblesNivel
-    : filtrarPorNivel(vocabularioCacheado || [], nivelSeleccionado);
-}
-
-function seleccionarDistractoresCompatibles(pool, correcta, campo, minimo = 2, ideal = 3) {
-  const categoriaObjetivo = getCategoriaGramatical(correcta);
-  const base = pool.filter(p =>
-    normalizar(p[campo]) !== normalizar(correcta[campo]) &&
-    normalizar(p.aleman) !== normalizar(correcta.aleman)
-  );
-
-  const mismaCategoriaNivel = base
-    .filter(p => getCategoriaGramatical(p) === categoriaObjetivo)
-    .map(p => ({ item: p, score: puntuarDistractor(p, correcta, campo) }))
-    .sort((a, b) => b.score - a.score)
-    .map(entry => entry.item);
-
-  if (mismaCategoriaNivel.length >= minimo) {
-    return mismaCategoriaNivel.slice(0, Math.min(ideal, mismaCategoriaNivel.length));
+  if (text.access_status) {
+    bits.push(`<span class="txdet-pill txdet-pill--muted">${escapeHtml(text.access_status)}</span>`);
   }
 
-  const fallbackGlobal = (vocabularioCacheado || [])
-    .filter(p =>
-      normalizar(p[campo]) !== normalizar(correcta[campo]) &&
-      normalizar(p.aleman) !== normalizar(correcta.aleman) &&
-      getCategoriaGramatical(p) === categoriaObjetivo
-    )
-    .map(p => ({ item: p, score: puntuarDistractor(p, correcta, campo) }))
-    .sort((a, b) => b.score - a.score)
-    .map(entry => entry.item);
-
-  const combinados = [...new Map([...mismaCategoriaNivel, ...fallbackGlobal].map(item => [item.aleman, item])).values()];
-  return combinados.slice(0, Math.min(ideal, combinados.length));
-}
-
-function crearTestOpciones(lista, correcta, campo) {
-  const distractores = seleccionarDistractoresCompatibles(lista, correcta, campo, 2, 3).map(p => p[campo]);
-
-  if (distractores.length < 2) return null;
-
-  const opciones = shuffle([correcta[campo], ...distractores]);
-  const letras = ['A', 'B', 'C', 'D'];
-  const mapa = {};
-  opciones.forEach((texto, i) => { mapa[letras[i]] = texto; });
-  return { mapa, correcta: letras.find(l => mapa[l] === correcta[campo]) };
-}
-
-function generarEjercicios(lista, numPalabras, actividadesActivas = actividadesSeleccionadas) {
-  const activos = getTiposEfectivos(actividadesActivas);
-  const porTipo = Math.max(1, Math.ceil(numPalabras / activos.length));
-  const baseLista = [...lista];
-  const poolNivel = getPoolDistractoresNivel();
-  const baseArticulos = activos.length === 1 && activos[0] === 'articulo'
-    ? seleccionarPalabrasPriorizadas(poolNivel.filter(p => extraerArticulo(p.aleman)), numPalabras)
-    : baseLista.filter(p => extraerArticulo(p.aleman));
-
-  const candidatosPorTipo = {
-    flashcards: baseLista.map(item => ({
-      tipo: 'flashcards',
-      pregunta: item.aleman,
-      preguntaSub: 'Piensa la traducción y marca si la sabías antes de verla',
-      respuestaCorrecta: item.espanol,
-      palabraBase: item.aleman,
-      traduccionBase: item.espanol
-    })),
-    test: baseLista.map(item => {
-      const pack = crearTestOpciones(poolNivel, item, 'espanol');
-      if (!pack) return null;
-      return {
-        tipo: 'test',
-        pregunta: item.aleman,
-        preguntaSub: 'Selecciona la traducción correcta',
-        opcionA: pack.mapa.A,
-        opcionB: pack.mapa.B,
-        opcionC: pack.mapa.C,
-        opcionD: pack.mapa.D,
-        respuestaCorrecta: pack.correcta,
-        palabraBase: item.aleman,
-        traduccionBase: item.espanol
-      };
-    }).filter(Boolean),
-    lueckentext: baseLista.filter(p => p.frase).map(item => {
-      const formasCandidatas = [item.aleman, quitarArticulo(item.aleman)]
-        .map(txt => String(txt || '').trim())
-        .filter(Boolean)
-        .filter((txt, idx, arr) => arr.indexOf(txt) === idx)
-        .sort((a, b) => b.length - a.length);
-
-      let frase = item.frase;
-      let encontrada = false;
-      formasCandidatas.forEach(forma => {
-        if (encontrada) return;
-        const regex = new RegExp(`(^|\\b)${escaparRegex(forma)}(?=\\b)`, 'i');
-        const reemplazada = frase.replace(regex, '$1___');
-        if (reemplazada !== frase) {
-          frase = reemplazada;
-          encontrada = true;
-        }
-      });
-      if (!encontrada) return null;
-
-      const pack = crearTestOpciones(poolNivel, item, 'aleman');
-      if (!pack) return null;
-
-      return {
-        tipo: 'lueckentext',
-        pregunta: frase,
-        preguntaSub: 'Elige la palabra que falta',
-        opcionA: pack.mapa.A,
-        opcionB: pack.mapa.B,
-        opcionC: pack.mapa.C,
-        opcionD: pack.mapa.D,
-        respuestaCorrecta: pack.correcta,
-        traducciones: Object.fromEntries(
-          Object.values(pack.mapa).map(aleman => [
-            aleman,
-            lista.find(p => p.aleman === aleman)?.espanol || ''
-          ])
-        ),
-        palabraBase: item.aleman,
-        traduccionBase: item.espanol
-      };
-    }).filter(Boolean),
-    articulo: baseArticulos.map(item => {
-      const art = extraerArticulo(item.aleman);
-      const mapa = { A: 'der', B: 'die', C: 'das' };
-      return {
-        tipo: 'articulo',
-        pregunta: quitarArticulo(item.aleman),
-        preguntaSub: '¿Qué artículo lleva este sustantivo?',
-        opcionA: 'der',
-        opcionB: 'die',
-        opcionC: 'das',
-        respuestaCorrecta: Object.keys(mapa).find(k => mapa[k] === art),
-        palabraBase: item.aleman,
-        traduccionBase: item.espanol
-      };
-    }),
-    ordenar: baseLista
-      .filter(item => String(item.frase || '').trim())
-      .map(item => {
-        const frase = String(item.frase || '').trim();
-        return {
-          tipo: 'ordenar',
-          pregunta: 'Ordena la oración correctamente',
-          preguntaSub: 'Clica las palabras en el orden correcto',
-          palabras: shuffle(frase.split(' ')),
-          respuestaCorrecta: frase,
-          palabraBase: item.aleman,
-          traduccionBase: item.espanol
-        };
-      })
-  };
-
-  const ejs = [];
-  activos.forEach(tipo => {
-    ejs.push(...sample(candidatosPorTipo[tipo] || [], porTipo));
-  });
-
-  if (ejs.length < numPalabras) {
-    const existentes = new Set(ejs.map(ej => `${ej.tipo}::${ej.palabraBase}`));
-    const sobrantes = shuffle(
-      activos.flatMap(tipo => (candidatosPorTipo[tipo] || []).filter(ej => !existentes.has(`${ej.tipo}::${ej.palabraBase}`)))
-    );
-    ejs.push(...sobrantes.slice(0, numPalabras - ejs.length));
+  if (text.published_at) {
+    bits.push(`<span class="txdet-meta-date">${escapeHtml(formatDate(text.published_at))}</span>`);
   }
 
-  return shuffle(ejs).slice(0, Math.min(numPalabras, ejs.length));
+  return bits.join('');
 }
 
-function renderEjercicio(ej, num, total, respuestaAnterior) {
-  limpiarTemporizadores();
-  animarCambioPregunta();
-  respuestaBloqueada = Boolean(respuestaAnterior);
-  seleccionActual = Array.isArray(respuestaAnterior) ? [...respuestaAnterior] : respuestaAnterior ?? null;
-  $('btn-siguiente').disabled = false;
-  $('btn-siguiente').textContent = num === total ? 'Ver resultado →' : 'Siguiente →';
-  $('btn-atras').disabled = num <= 1;
-  $('prog-actual').textContent = num;
-  $('prog-total').textContent = total;
-  $('prog-fill').style.width = `${((num - 1) / total) * 100}%`;
-  renderProgresoDots(num, total);
+function renderTextBody(text) {
+  const raw = String(text.text_content || '').trim();
 
-  const labels = {
-    flashcards: 'Flashcards',
-    test: 'Test',
-    lueckentext: 'Lückentext',
-    articulo: 'Artículo',
-    ordenar: 'Ordenar frases'
-  };
-
-  $('tipo-badge').textContent = labels[ej.tipo];
-  $('pregunta-texto').textContent = ej.pregunta;
-  $('pregunta-sub').textContent = ej.preguntaSub || '';
-  configurarTraduccion(ej);
-  limpiarFeedbackRespuesta();
-  $('opciones-wrap').innerHTML = '';
-  hide('opciones-wrap');
-  hide('flashcard-wrap');
-  hide('input-wrap');
-  hide('ordenar-wrap');
-
-  if (ej.tipo === 'flashcards') {
-    show('flashcard-wrap');
-    const card = $('flashcard-card');
-    $('flashcard-front').textContent = ej.pregunta;
-    $('flashcard-back').textContent = ej.respuestaCorrecta;
-    card.classList.toggle('revealed', Boolean(respuestaAnterior));
-    seleccionActual = respuestaAnterior ?? null;
-    $('btn-siguiente').disabled = false;
-    $('btn-flashcard-si').disabled = Boolean(respuestaAnterior);
-    $('btn-flashcard-no').disabled = Boolean(respuestaAnterior);
-    $('btn-flashcard-si').onclick = () => {
-      if (respuestaBloqueada) return;
-      respuestaBloqueada = true;
-      seleccionActual = 'si';
-      card.classList.add('revealed');
-      mostrarFeedbackRespuesta(true);
-      $('btn-flashcard-si').disabled = true;
-      $('btn-flashcard-no').disabled = true;
-      $('btn-siguiente').disabled = false;
-      iniciarCuentaAtrasAutoavance();
-    };
-    $('btn-flashcard-no').onclick = () => {
-      if (respuestaBloqueada) return;
-      respuestaBloqueada = true;
-      seleccionActual = 'no';
-      card.classList.add('revealed');
-      mostrarFeedbackRespuesta(false);
-      $('btn-flashcard-si').disabled = true;
-      $('btn-flashcard-no').disabled = true;
-      $('btn-siguiente').disabled = false;
-      iniciarCuentaAtrasAutoavance();
-    };
-    if (respuestaAnterior) {
-      mostrarFeedbackRespuesta(String(respuestaAnterior).toLowerCase() === 'si', false);
-    }
-    return;
+  if (!raw) {
+    return `
+      <p class="txdet-empty">
+        Este texto todavía no tiene contenido base guardado en Supabase.
+        Puedes continuar igualmente a los ejercicios si el vocabulario del nivel ya está cargado.
+      </p>
+    `;
   }
 
-  if (ej.tipo === 'ordenar') {
-    show('ordenar-wrap');
-    const banco = $('banco-palabras');
-    const construccion = $('orden-construccion');
-    banco.innerHTML = '';
-    construccion.innerHTML = '';
-    construccion.classList.remove('orden-correcta', 'orden-incorrecta');
-    seleccionActual = [];
-
-    const addWord = (word, sourceChip) => {
-      if (respuestaBloqueada) return;
-      sourceChip.classList.add('usada');
-      seleccionActual.push(word);
-      const c2 = document.createElement('span');
-      c2.className = 'palabra-chip';
-      c2.textContent = word;
-      c2.onclick = () => {
-        if (respuestaBloqueada) return;
-        const idx = seleccionActual.findIndex((w, i) => w === word && i === [...construccion.children].indexOf(c2));
-        if (idx > -1) {
-          seleccionActual.splice(idx, 1);
-        } else {
-          const fallback = seleccionActual.lastIndexOf(word);
-          if (fallback > -1) seleccionActual.splice(fallback, 1);
-        }
-        sourceChip.classList.remove('usada');
-        c2.remove();
-        $('btn-siguiente').disabled = false;
-      };
-      construccion.appendChild(c2);
-      $('btn-siguiente').disabled = false;
-
-      if (seleccionActual.length === ej.respuestaCorrecta.split(' ').length) {
-        respuestaBloqueada = true;
-        [...banco.children].forEach(chip => {
-          chip.classList.add('bloqueada');
-          chip.style.pointerEvents = 'none';
-        });
-        const correcto = evaluar(ej, seleccionActual);
-        construccion.classList.add(correcto ? 'orden-correcta' : 'orden-incorrecta');
-        mostrarFeedbackRespuesta(correcto);
-        iniciarCuentaAtrasAutoavance();
-      }
-    };
-
-    ej.palabras.forEach(p => {
-      const chip = document.createElement('span');
-      chip.className = 'palabra-chip';
-      chip.textContent = p;
-      chip.onclick = () => {
-        if (chip.classList.contains('usada')) return;
-        addWord(p, chip);
-      };
-      banco.appendChild(chip);
-    });
-
-    if (Array.isArray(respuestaAnterior) && respuestaAnterior.length > 0) {
-      respuestaAnterior.forEach(p => {
-        const chip = [...banco.children].find(c => c.textContent === p && !c.classList.contains('usada'));
-        if (chip) chip.click();
-      });
-    }
-
-    return;
-  }
-
-  const opciones = [
-    { l: 'A', t: ej.opcionA },
-    { l: 'B', t: ej.opcionB },
-    { l: 'C', t: ej.opcionC }
-  ];
-  if (ej.opcionD) opciones.push({ l: 'D', t: ej.opcionD });
-
-  show('opciones-wrap', 'grid');
-  $('opciones-wrap').className = ej.tipo === 'articulo' ? 'opciones tres' : 'opciones';
-
-  opciones.forEach(op => {
-    const btn = document.createElement('button');
-    btn.className = 'opcion-btn';
-    btn.dataset.opcion = op.l;
-    const contenido = document.createElement('div');
-    contenido.className = 'opcion-contenido';
-    const texto = document.createElement('span');
-    texto.textContent = op.t;
-    contenido.appendChild(texto);
-
-    if (ej.tipo === 'articulo') {
-      btn.classList.add(`articulo-${op.t.toLowerCase()}`);
-    }
-
-    if (ej.tipo === 'lueckentext' && ej.traducciones) {
-      const ayuda = document.createElement('span');
-      ayuda.textContent = '💬';
-      ayuda.className = 'ayuda-icono';
-      const tooltip = document.createElement('span');
-      tooltip.className = 'tooltip-traduccion';
-      tooltip.textContent = ej.traducciones[op.t] || '';
-      ayuda.onclick = e => {
-        e.stopPropagation();
-        tooltip.style.display = tooltip.style.display === 'none' ? 'inline' : 'none';
-      };
-      contenido.appendChild(ayuda);
-      contenido.appendChild(tooltip);
-    }
-
-    btn.appendChild(contenido);
-    if (respuestaAnterior === op.l) btn.classList.add('seleccionada');
-
-    btn.onclick = e => {
-      if (e.target.classList.contains('ayuda-icono')) return;
-      if (respuestaBloqueada) return;
-      respuestaBloqueada = true;
-      seleccionActual = op.l;
-      aplicarFeedbackOpciones(ej, op.l);
-      $('btn-siguiente').disabled = false;
-      iniciarCuentaAtrasAutoavance();
-    };
-
-    $('opciones-wrap').appendChild(btn);
-  });
-
-  if (respuestaAnterior) {
-    aplicarFeedbackOpciones(ej, respuestaAnterior, false);
-    $('btn-siguiente').disabled = false;
-  }
+  return raw
+    .split(/\n\s*\n/)
+    .map(paragraph => `<p>${escapeHtml(paragraph).replace(/\n/g, '<br>')}</p>`)
+    .join('');
 }
 
-function evaluar(ej, respuesta) {
-  if (ej.tipo === 'flashcards') return String(respuesta || '').toLowerCase() === 'si';
-  if (ej.tipo === 'ordenar') return normalizar((respuesta || []).join(' ')) === normalizar(ej.respuestaCorrecta);
-  return String(respuesta || '').toUpperCase() === String(ej.respuestaCorrecta || '').toUpperCase();
+function formatDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  return new Intl.DateTimeFormat('es-ES', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric'
+  }).format(date);
 }
 
-function textoUsuario(ej, respuesta) {
-  if (ej.tipo === 'flashcards') return String(respuesta || '').toLowerCase() === 'si' ? 'Sí' : 'No la sé';
-  if (ej.tipo === 'ordenar') return (respuesta || []).join(' ') || '—';
-  return { A: ej.opcionA, B: ej.opcionB, C: ej.opcionC, D: ej.opcionD }[respuesta] || '—';
-}
+/* ── NAV BUTTONS ─────────────────────────────────────────────── */
+$('btn-atras').addEventListener('click', () => {
+  if (currentIdx > 0) { currentIdx--; buildExercise(); }
+});
 
-function textoCorrecta(ej) {
-  if (ej.tipo === 'flashcards') return ej.respuestaCorrecta;
-  if (ej.tipo === 'ordenar') return ej.respuestaCorrecta;
-  return { A: ej.opcionA, B: ej.opcionB, C: ej.opcionC, D: ej.opcionD }[ej.respuestaCorrecta] || ej.respuestaCorrecta;
-}
+$('btn-terminar').addEventListener('click', () => { showResultado(); });
 
-function actualizarBloqueContinuar() {
-  const btn = $('btn-continuar');
-  if (btn) hide('btn-continuar');
-  $('btn-reiniciar').textContent = 'Repetir';
-}
+/* ══════════════════════════════════════════════════════════════
+   RESULTADO
+══════════════════════════════════════════════════════════════ */
+function showResultado() {
+  showScreen('resultado');
 
-function mostrarResultado() {
-  limpiarTemporizadores();
-  limpiarProgreso();
-  hide('screen-ejercicio');
-  show('screen-resultado');
+  const total = score.correct + score.wrong;
+  const pct   = total > 0 ? Math.round((score.correct / total) * 100) : 0;
 
-  const contestadas = respuestas.filter(Boolean);
-  const noRespondidas = Math.max(ejercicios.length - contestadas.length, 0);
-  actualizarStatsPalabras(contestadas);
+  $('punt-grande').textContent = `${pct}%`;
+  $('punt-label').textContent  = pct >= 80 ? '¡Sehr gut! 🎉' : pct >= 60 ? '¡Gut gemacht! 👍' : 'Sigue practicando 💪';
 
-  const correctas = contestadas.filter(r => r.correcto).length;
-  const total = ejercicios.length;
-  const errores = contestadas.filter(r => !r.correcto);
-  erroresUltimoResultado = errores;
-  const pct = total > 0 ? Math.round((correctas / total) * 100) : 0;
-
-  $('punt-grande').textContent = `${correctas}/${total}`;
   $('result-stats').innerHTML = `
-    <span>${correctas} aciertos</span>
-    <span>${errores.length} errores</span>
-    <span>${noRespondidas} no respondidas</span>
+    <div class="stat-item"><span class="stat-val">${score.correct}</span><span class="stat-lbl">Correctas</span></div>
+    <div class="stat-item"><span class="stat-val">${score.wrong}</span><span class="stat-lbl">Errores</span></div>
+    <div class="stat-item"><span class="stat-val">${queue.length}</span><span class="stat-lbl">Palabras</span></div>
   `;
-  $('punt-label').textContent =
-    pct >= 80
-      ? '¡Sehr gut! Sigue así 🎉'
-      : pct >= 50
-        ? 'Gut gemacht, sigue practicando 💪'
-        : 'Übung macht den Meister — ¡inténtalo de nuevo!';
 
-  const lista = $('resumen-lista');
-  lista.innerHTML = '';
-  const resumen = errores.length > 0 ? errores : [];
-  if (resumen.length === 0) {
-    const div = document.createElement('div');
-    div.className = 'resumen-item';
-    div.innerHTML = '<span class="resumen-icon">✓</span><div><div class="resumen-correcta">No hay fallos para repasar.</div></div>';
-    lista.appendChild(div);
+  // Save progress
+  if (selectedText) {
+    const pKey = `progress_${selectedText.id}_${selectedLevel}`;
+    const existing = JSON.parse(localStorage.getItem(pKey) || '{}');
+    localStorage.setItem(pKey, JSON.stringify({
+      total: existing.total || queue.length,
+      done: (existing.done || 0) + score.correct,
+    }));
   }
-  resumen.forEach(r => {
-    const div = document.createElement('div');
-    div.className = 'resumen-item';
-    div.innerHTML = `
-      <span class="resumen-icon">${r.correcto ? '✓' : '✗'}</span>
-      <div>
-        <div class="resumen-pregunta">${r.pregunta}</div>
-        ${r.correcto
-          ? `<div class="resumen-correcta">${r.tuya}</div>`
-          : `<div class="resumen-tuya">Tu respuesta: ${r.tuya}</div><div class="resumen-correcta">Correcta: ${r.correcta}</div>`
-        }
-      </div>`;
-    lista.appendChild(div);
-  });
 
-  actualizarPanelProgresoSemanal();
-  actualizarBloqueContinuar();
-  const btnErrores = $('btn-repasar-errores');
-  if (errores.length > 0) {
-    btnErrores.onclick = () => {
-      const ejerciciosOriginales = [...ejercicios];
-      const ejerciciosRepaso = errores
-        .map(error =>
-          error.ejercicioOriginal ||
-          ejerciciosOriginales[error.ejercicioIndex] ||
-          ejerciciosOriginales.find(ej => ej.palabraBase === error.palabraBase && ej.pregunta === error.pregunta)
-        )
-        .filter(Boolean);
-      ejercicios = ejerciciosRepaso;
-      indice = 0;
-      respuestas = Array(ejercicios.length).fill(null);
-      rachaActual = 0;
-      actualizarRacha(false);
-      hide('screen-resultado');
-      irAPantalla('screen-ejercicio');
-      renderEjercicio(ejercicios[0], 1, ejercicios.length, null);
-      guardarProgreso();
-    };
-    show('btn-repasar-errores');
-  } else {
-    hide('btn-repasar-errores');
-  }
-}
-
-function mostrarModalTerminar() {
-  const hechos = respuestas.filter(Boolean).length;
-  const quedan = ejercicios.length - hechos;
-
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'modal-terminar';
-  overlay.innerHTML = `
-    <div class="modal-box">
-      <span class="modal-emoji">🏳️</span>
-      <h3>¿Terminar el test?</h3>
-      <p>Llevas <strong>${hechos} ejercicio${hechos !== 1 ? 's' : ''}</strong> completado${hechos !== 1 ? 's' : ''}. Aún te quedan <strong>${quedan}</strong> por hacer.</p>
-      <div class="modal-btns">
-        <button class="btn-main-solo" id="modal-btn-terminar">Sí, terminar y ver resultados</button>
-        <button class="btn-modal-secondary" id="modal-btn-continuar">Seguir el test</button>
-      </div>
-    </div>`;
-
-  document.body.appendChild(overlay);
-
-  $('modal-btn-terminar').onclick = () => {
-    overlay.remove();
-    mostrarResultado();
+  $('btn-reiniciar').onclick = () => {
+    currentIdx = 0;
+    score = { correct: 0, wrong: 0 };
+    queue = [...queue].sort(() => Math.random() - .5);
+    showScreen('ejercicio');
+    buildExercise();
   };
-  $('modal-btn-continuar').onclick = () => overlay.remove();
-  overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
 }
 
-function actualizarStatsInicio() {
-  actualizarPanelProgresoSemanal();
-}
-
-function getResumenProgresoNivel() {
-  const disponibles = vocabularioCacheado ? filtrarPorNivel(vocabularioCacheado, nivelSeleccionado) : [];
-  const usadasSet = new Set(getPalabrasUsadas());
-  const practicadas = disponibles.filter(p => usadasSet.has(p.aleman)).length;
-  const pendientes = Math.max(disponibles.length - practicadas, 0);
-  const porcentaje = disponibles.length > 0 ? Math.round((practicadas / disponibles.length) * 100) : 0;
-  return { disponibles: disponibles.length, practicadas, pendientes, porcentaje };
-}
-
-function actualizarPanelProgresoSemanal() {
-  const resumen = getResumenProgresoNivel();
-  const nivelTexto = mapNivelSeleccionado(nivelSeleccionado);
-  $('weekly-progress-title').textContent = `Progreso ${nivelTexto}`;
-  $('weekly-progress-pct').textContent = `${resumen.porcentaje}% completado`;
-  $('weekly-progress-fill').style.width = `${resumen.porcentaje}%`;
-  $('weekly-progress-main').textContent = `${resumen.practicadas} / ${resumen.disponibles} palabras practicadas`;
-  $('weekly-progress-sub').textContent = `${resumen.disponibles} palabras en este nivel`;
-  $('btn-reset-progress').disabled = resumen.practicadas === 0;
-}
-
-function seleccionarSinRepetir(todasLasPalabras, nivel, n) {
-  const stats = getPalabrasStats();
-  const unseen = shuffle(
-    todasLasPalabras.filter(p => !stats[p.aleman] || (stats[p.aleman].aciertos + stats[p.aleman].fallos) === 0)
-  );
-
-  const vistasFueraCooldown = [...todasLasPalabras]
-    .filter(p => {
-      const stat = stats[p.aleman];
-      return stat && !unseen.find(x => x.aleman === p.aleman) && cooldownSuperado(p.aleman, stats, nivel);
-    })
-    .sort((a, b) => {
-      const sa = stats[a.aleman] || { fallos: 0, aciertos: 0 };
-      const sb = stats[b.aleman] || { fallos: 0, aciertos: 0 };
-      const diffFallos = (sb.fallos || 0) - (sa.fallos || 0);
-      if (diffFallos !== 0) return diffFallos;
-
-      const diffUltimaVez = getUltimaVezPalabraNivel(a.aleman, stats, nivel) - getUltimaVezPalabraNivel(b.aleman, stats, nivel);
-      if (diffUltimaVez !== 0) return diffUltimaVez;
-
-      return Math.random() - 0.5;
-    });
-
-  const resto = shuffle(
-    todasLasPalabras.filter(p =>
-      !unseen.find(x => x.aleman === p.aleman) &&
-      !vistasFueraCooldown.find(x => x.aleman === p.aleman)
-    )
-  );
-
-  return [...unseen, ...vistasFueraCooldown, ...resto].slice(0, Math.min(n, todasLasPalabras.length));
-}
-
-function seleccionarPalabrasPriorizadas(lista, cantidad) {
-  return seleccionarSinRepetir(lista, nivelSeleccionado, cantidad);
-}
-
-async function iniciar(continuar = false) {
-  hide('screen-activity');
-  hide('error-msg');
-  show('loading');
-
-  if (!continuar) {
-    try {
-      const palabras = vocabularioCacheado || await cargarVocabulario();
-      vocabularioCacheado = palabras;
-      actualizarNivelSeleccionado();
-      actualizarDisponibilidadNivel();
-      totalPalabras = Number($('slider-palabras').value);
-
-      const filtradasPorNivel = palabrasDisponiblesNivel;
-      if (filtradasPorNivel.length === 0) {
-        throw new Error('No hay palabras disponibles para este nivel.');
-      }
-      const pool = seleccionarPalabrasPriorizadas(filtradasPorNivel, totalPalabras);
-
-      ejercicios = generarEjercicios(pool, totalPalabras, actividadesSeleccionadas);
-      if (ejercicios.length === 0) throw new Error('No hay ejercicios disponibles para esta configuración.');
-      registrarAparicionesSesion(ejercicios.map(ej => ej.palabraBase), nivelSeleccionado);
-      indice = 0;
-      respuestas = Array(ejercicios.length).fill(null);
-    } catch (e) {
-      hide('loading');
-      show('screen-activity');
-      showError(`Error al cargar el vocabulario. ${e.message}`);
-      return;
-    }
-  }
-
-  hide('loading');
-  irAPantalla('screen-ejercicio');
-  renderEjercicio(ejercicios[indice], indice + 1, ejercicios.length, respuestas[indice]?._raw ?? null);
-  guardarProgreso();
-}
-
-async function precargar() {
-  try {
-    vocabularioCacheado = await cargarVocabulario();
-    actualizarDisponibilidadNivel();
-    actualizarStatsInicio();
-  } catch (e) {}
-}
-
-$('slider-palabras').oninput = e => {
-  $('num-palabras-display').textContent = e.target.value;
-};
-
-$('btn-empezar').onclick = () => iniciar(false);
-
-$('btn-siguiente').onclick = () => {
-  limpiarTemporizadores();
-  respuestas[indice] = snapshotRespuesta(ejercicios[indice], seleccionActual);
-  const esUltimo = indice === ejercicios.length - 1;
-
-  if (esUltimo) {
-    mostrarResultado();
-    return;
-  }
-
-  indice += 1;
-  renderEjercicio(ejercicios[indice], indice + 1, ejercicios.length, respuestas[indice]?._raw ?? null);
-  guardarProgreso();
-};
-
-$('btn-atras').onclick = () => {
-  if (indice <= 0) return;
-  limpiarTemporizadores();
-
-  const actual = snapshotRespuesta(ejercicios[indice], seleccionActual);
-  respuestas[indice] = actual;
-  indice -= 1;
-  renderEjercicio(ejercicios[indice], indice + 1, ejercicios.length, respuestas[indice]?._raw ?? null);
-  guardarProgreso();
-};
-
-$('btn-terminar').onclick = () => {
-  limpiarTemporizadores();
-  respuestas[indice] = snapshotRespuesta(ejercicios[indice], seleccionActual);
-  guardarProgreso();
-  mostrarModalTerminar();
-};
-
-$('btn-reiniciar').onclick = () => {
-  limpiarProgreso();
-  limpiarTemporizadores();
-  indice = 0;
-  respuestas = Array(ejercicios.length).fill(null);
-  rachaActual = 0;
-  actualizarRacha(false);
-  hide('screen-resultado');
-  irAPantalla('screen-ejercicio');
-  renderEjercicio(ejercicios[0], 1, ejercicios.length, null);
-  guardarProgreso();
-};
-
-$('btn-volver-menu').onclick = () => {
-  limpiarProgreso();
-  limpiarTemporizadores();
-  rachaActual = 0;
-  actualizarRacha(false);
-  hide('screen-resultado');
-  irAPantalla('screen-activity');
-  actualizarStatsInicio();
-};
-
-$('btn-salir-test').onclick = () => {
-  limpiarProgreso();
-  limpiarTemporizadores();
-  rachaActual = 0;
-  actualizarRacha(false);
-  hide('main-app');
-  hide('app-header');
-  show('screen-landing', 'flex');
-};
-
-$('btn-reset-progress').onclick = () => {
-  resetPalabrasUsadas();
-  limpiarProgreso();
-  actualizarStatsInicio();
-  actualizarDisponibilidadNivel();
-};
-
-document.querySelectorAll('#practice-selector .config-chip').forEach(btn => {
-  btn.onclick = () => {
-    btn.classList.toggle('active');
-    actualizarHintActividad();
-  };
+$('btn-volver-menu').addEventListener('click', () => {
+  showScreen('activity');
 });
 
-document.querySelectorAll('#level-selector .config-chip').forEach(btn => {
-  btn.onclick = () => {
-    activarNivelEnPantalla(btn.dataset.level);
-    actualizarDisponibilidadNivel();
-  };
+$('btn-salir-test').addEventListener('click', () => {
+  goToTextos();
 });
 
-$('btn-volver-landing').onclick = () => {
-  hide('main-app');
-  hide('app-header');
-  show('screen-landing', 'flex');
-};
+/* ── TRANSLATION TOGGLE ──────────────────────────────────────── */
+$('btn-toggle-traduccion').addEventListener('click', () => {
+  $('translation-panel').classList.toggle('visible');
+  $('btn-toggle-traduccion').textContent =
+    $('translation-panel').classList.contains('visible') ? 'Ocultar' : 'Ver traducción';
+});
 
-$('btn-ir-actividad').onclick = () => {
-  irAPantalla('screen-activity');
-};
+/* ══════════════════════════════════════════════════════════════
+   INIT
+══════════════════════════════════════════════════════════════ */
+// Initial state: show landing
+$('main-app').style.display = 'none';
 
-$('btn-volver-contenido').onclick = () => {
-  irAPantalla('screen-content');
-};
-
-$('btn-open-text').href = CURRENT_TEXT_URL;
-
-$('btn-entrar').onclick = () => {
-  hide('screen-landing');
-  show('main-app', 'flex');
-  show('app-header');
-  irAPantalla('screen-content');
-  precargar();
-  hide('progreso-guardado-banner');
-
-  const guardado = cargarProgresoGuardado();
-  if (guardado && guardado.ejercicios && guardado.indice < guardado.ejercicios.length) {
-    const banner = $('progreso-guardado-banner');
-    $('prog-guardado-txt').textContent = `Ejercicio ${guardado.indice + 1} de ${guardado.ejercicios.length}`;
-    show('progreso-guardado-banner');
-    banner.onclick = () => {
-      ejercicios = guardado.ejercicios;
-      indice = guardado.indice;
-      respuestas = guardado.respuestas;
-      totalPalabras = guardado.totalPalabras;
-      nivelSeleccionado = typeof guardado.nivelSeleccionado === 'string'
-        ? normalizarNivelGuardado(guardado.nivelSeleccionado)
-        : 'b1';
-      actividadesSeleccionadas = normalizarActividadesGuardadas(
-        guardado.actividadesSeleccionadas ?? guardado.actividadSeleccionada
-      );
-      activarNivelEnPantalla(nivelSeleccionado);
-      actualizarDisponibilidadNivel();
-      activarActividadesEnPantalla(actividadesSeleccionadas);
-      hide('progreso-guardado-banner');
-      irAPantalla('screen-ejercicio');
-      renderEjercicio(ejercicios[indice], indice + 1, ejercicios.length, respuestas[indice]?._raw ?? null);
-    };
-  }
-};
-
-activarNivelEnPantalla('b1');
-activarActividadesEnPantalla([]);
+// Preload slider max on level change handled inside loadActivityScreen
